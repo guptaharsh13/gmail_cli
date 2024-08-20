@@ -306,18 +306,22 @@ impl TerminalUI {
                         }
                     }
                     KeyCode::PageUp => {
-                        if self.scroll_offset > 0 {
-                            self.scroll_offset = self.scroll_offset.saturating_sub(10);
-                        }
+                        self.scroll_offset = self.scroll_offset.saturating_sub(10);
                     }
                     KeyCode::PageDown => {
-                        self.scroll_offset += 10;
+                        if let Some(email) = app.emails.get(app.current_index) {
+                            let content_height = email.body.lines().count();
+                            let visible_height = terminal.size()?.height as usize - 6; // Subtracting space for borders and status bar
+                            let max_scroll = content_height.saturating_sub(visible_height);
+                            self.scroll_offset = (self.scroll_offset + 10).min(max_scroll);
+                        }
                     }
                     _ => {}
                 }
             }
         }
     }
+
 
     async fn run(&mut self) -> io::Result<()> {
         enable_raw_mode()?;
