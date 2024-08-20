@@ -166,7 +166,9 @@ impl TerminalUI {
         f.render_widget(email_content, main_chunks[1]);
 
         // Render status bar
-        let status_bar = Paragraph::new(self.status_message.clone())
+        let status_bar_width = chunks[1].width as usize - 2; // Subtracting 2 for borders
+        let truncated_message = self.truncate_with_ellipsis(&self.status_message, status_bar_width);
+        let status_bar = Paragraph::new(truncated_message)
             .style(Style::default().fg(Color::White).bg(Color::Black))
             .block(Block::default().borders(Borders::ALL))
             .wrap(Wrap { trim: true });
@@ -185,6 +187,27 @@ impl TerminalUI {
         };
 
         f.render_widget(controls, control_area);
+    }
+
+    fn truncate_with_ellipsis(&self, s: &str, max_width: usize) -> String {
+        if s.len() <= max_width {
+            s.to_string()
+        } else {
+            let mut result = String::with_capacity(max_width);
+            let mut char_indices = s.char_indices();
+            let mut current_width = 0;
+
+            while let Some((idx, ch)) = char_indices.next() {
+                if current_width + ch.len_utf8() + 3 > max_width { // +3 for "..."
+                    result.push_str("...");
+                    break;
+                }
+                result.push(ch);
+                current_width += ch.len_utf8();
+            }
+
+            result
+        }
     }
 
     async fn run_app<B: Backend>(&mut self, terminal: &mut Terminal<B>) -> io::Result<()> {
