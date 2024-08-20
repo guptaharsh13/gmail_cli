@@ -4,6 +4,8 @@ use serde::{Deserialize, Serialize};
 use base64::{Engine as _, engine::general_purpose};
 use html2text::from_read;
 use pulldown_cmark::{Parser, html};
+use reqwest::Client;
+use futures::future::try_join_all;
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct Email {
@@ -49,14 +51,14 @@ struct Body {
 }
 
 pub struct GmailClient {
-    client: reqwest::Client,
+    client: Client,
     token: AccessToken,
 }
 
 impl GmailClient {
     pub fn new(token: AccessToken) -> Self {
         Self {
-            client: reqwest::Client::new(),
+            client: Client::new(),
             token,
         }
     }
@@ -73,13 +75,12 @@ impl GmailClient {
         let messages = response["messages"].as_array()
             .ok_or("No messages found")?;
 
-        let mut emails = Vec::new();
-
-        for message in messages {
-            let id = message["id"].as_str().ok_or("No id found")?;
-            let email = self.fetch_email(id).await?;
-            emails.push(email);
-        }
+        let emails = try_join_all(
+            messages.iter().map(|message| {
+                let id = message["id"].as_str().ok_or("No id found").unwrap_or_default();
+                self.fetch_email(id)
+            })
+        ).await?;
 
         Ok(emails)
     }
@@ -103,7 +104,6 @@ impl GmailClient {
             .unwrap_or_default();
 
         let unsubscribe_link = self.extract_unsubscribe_link(&msg.payload.headers);
-
         let body = self.extract_body(&msg.payload)?;
 
         Ok(Email {
@@ -118,39 +118,24 @@ impl GmailClient {
         headers.iter()
             .find(|h| h.name == "List-Unsubscribe")
             .and_then(|h| {
-                // First, try to find a URL in angle brackets
-                let urls: Vec<&str> = h.value
+                h.value
                     .split(',')
-                    .filter_map(|part| {
+                    .find_map(|part| {
                         let trimmed = part.trim();
                         if trimmed.starts_with('<') && trimmed.ends_with('>') {
-                            Some(&trimmed[1..trimmed.len()-1])
+                            Some(trimmed[1..trimmed.len()-1].to_string())
                         } else {
                             None
                         }
                     })
-                    .collect();
-
-                // Prioritize http/https URLs over mailto
-                urls.iter()
-                    .find(|&&url| url.starts_with("http"))
-                    .or_else(|| urls.first())
-                    .map(|&url| url.to_string())
+                    .or_else(|| Some(h.value.clone()))
             })
     }
 
     fn extract_body(&self, payload: &Payload) -> Result<String, Box<dyn Error>> {
-        // First, try to get content from the main body
-        if let Some(content) = self.get_content_from_body(&payload.body) {
-            return Ok(content);
-        }
-
-        // If main body is empty, try to get content from parts
-        if let Some(parts) = &payload.parts {
-            return self.get_content_from_parts(parts);
-        }
-
-        Ok("No readable content found in the email.".to_string())
+        Ok(self.get_content_from_body(&payload.body)
+            .or_else(|| payload.parts.as_ref().and_then(|parts| self.get_content_from_parts(parts).ok()))
+            .unwrap_or_else(|| "No readable content found in the email.".to_string()))
     }
 
     fn get_content_from_body(&self, body: &Body) -> Option<String> {
@@ -174,7 +159,6 @@ impl GmailClient {
                     }
                 }
                 _ => {
-                    // For multipart types, recursively check their parts
                     if let Some(subparts) = &part.parts {
                         let content = self.get_content_from_parts(subparts)?;
                         if !content.is_empty() {
@@ -185,7 +169,6 @@ impl GmailClient {
             }
         }
 
-        // Prefer HTML content if available, otherwise use plain text
         if !text_html.is_empty() {
             Ok(from_read(text_html.as_bytes(), 80))
         } else if !text_plain.is_empty() {
@@ -197,15 +180,11 @@ impl GmailClient {
 
     fn decode_and_render_body(&self, encoded_body: &str) -> Result<String, Box<dyn Error>> {
         let decoded = general_purpose::STANDARD.decode(encoded_body.replace('-', "+").replace('_', "/"))?;
-        let body = String::from_utf8(decoded)
-            .map_err(|e| Box::new(e) as Box<dyn Error>)?;
+        let body = String::from_utf8(decoded)?;
         
-        // Determine if the content is HTML or Markdown
         if body.contains("&lt;") || body.contains("&gt;") || body.contains("&amp;") {
-            // Likely HTML content
             Ok(from_read(body.as_bytes(), 80))
         } else {
-            // Likely Markdown content
             let parser = Parser::new(&body);
             let mut html_output = String::new();
             html::push_html(&mut html_output, parser);
