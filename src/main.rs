@@ -14,9 +14,10 @@ use tui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Span, Spans},
-    widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Wrap},
+    widgets::{Block, Borders, List, ListItem, ListState, Widget},
     Frame, Terminal,
 };
+use unicode_width::UnicodeWidthStr;
 
 mod gmail_api;
 use gmail_api::{Email, GmailClient};
@@ -106,9 +107,69 @@ impl App {
     }
 }
 
+struct ScrollableText<'a> {
+    content: &'a str,
+    offset: usize,
+    block: Option<Block<'a>>,
+    style: Style,
+}
+
+impl<'a> ScrollableText<'a> {
+    pub fn new(content: &'a str) -> ScrollableText<'a> {
+        ScrollableText {
+            content,
+            offset: 0,
+            block: None,
+            style: Style::default(),
+        }
+    }
+
+    pub fn block(mut self, block: Block<'a>) -> ScrollableText<'a> {
+        self.block = Some(block);
+        self
+    }
+
+    pub fn style(mut self, style: Style) -> ScrollableText<'a> {
+        self.style = style;
+        self
+    }
+
+    pub fn scroll(&mut self, offset: usize) {
+        self.offset = offset;
+    }
+}
+
+impl<'a> Widget for ScrollableText<'a> {
+    fn render(mut self, area: Rect, buf: &mut tui::buffer::Buffer) {
+        let text_area = match self.block.take() {
+            Some(b) => {
+                let inner_area = b.inner(area);
+                b.render(area, buf);
+                inner_area
+            }
+            None => area,
+        };
+
+        let lines: Vec<&str> = self.content.lines().skip(self.offset).collect();
+        for (i, line) in lines.iter().enumerate() {
+            if i >= text_area.height as usize {
+                break;
+            }
+            let trimmed_line = line.trim_end();
+            buf.set_string(
+                text_area.left(),
+                text_area.top() + i as u16,
+                trimmed_line,
+                self.style,
+            );
+        }
+    }
+}
+
 struct TerminalUI {
     app: Arc<Mutex<App>>,
     status_message: String,
+    scroll_offset: usize,
 }
 
 impl TerminalUI {
@@ -116,6 +177,7 @@ impl TerminalUI {
         Self {
             app,
             status_message: String::new(),
+            scroll_offset: 0,
         }
     }
 
@@ -159,24 +221,25 @@ impl TerminalUI {
             String::from("No email selected")
         };
         
-        let email_content = Paragraph::new(email_content)
+        let mut scrollable_content = ScrollableText::new(&email_content)
             .block(Block::default().borders(Borders::ALL).title("Content"))
-            .wrap(Wrap { trim: true });
+            .style(Style::default());
+        scrollable_content.scroll(self.scroll_offset);
         
-        f.render_widget(email_content, main_chunks[1]);
+        f.render_widget(scrollable_content, main_chunks[1]);
 
         // Render status bar
         let status_bar_width = chunks[1].width as usize - 2; // Subtracting 2 for borders
         let truncated_message = self.truncate_with_ellipsis(&self.status_message, status_bar_width);
-        let status_bar = Paragraph::new(truncated_message)
+        let status_bar = tui::widgets::Paragraph::new(truncated_message)
             .style(Style::default().fg(Color::White).bg(Color::Black))
             .block(Block::default().borders(Borders::ALL))
-            .wrap(Wrap { trim: true });
+            .wrap(tui::widgets::Wrap { trim: true });
 
         f.render_widget(status_bar, chunks[1]);
 
         // Render controls
-        let controls = Paragraph::new("Q: Quit | R: Mark as Read | U: Unsubscribe | ↑↓: Navigate")
+        let controls = tui::widgets::Paragraph::new("Q: Quit | R: Mark as Read | U: Unsubscribe | ↑↓: Navigate | PgUp/PgDn: Scroll")
             .style(Style::default().fg(Color::White).bg(Color::DarkGray));
 
         let control_area = Rect {
@@ -221,11 +284,13 @@ impl TerminalUI {
                     KeyCode::Up => {
                         if app.current_index > 0 {
                             app.current_index -= 1;
+                            self.scroll_offset = 0;  // Reset scroll when changing emails
                         }
                     }
                     KeyCode::Down => {
                         if app.current_index < app.emails.len().saturating_sub(1) {
                             app.current_index += 1;
+                            self.scroll_offset = 0;  // Reset scroll when changing emails
                         }
                     }
                     KeyCode::Char('r') => {
@@ -239,6 +304,14 @@ impl TerminalUI {
                             Ok(message) => self.status_message = message,
                             Err(e) => self.status_message = format!("Error unsubscribing: {}", e),
                         }
+                    }
+                    KeyCode::PageUp => {
+                        if self.scroll_offset > 0 {
+                            self.scroll_offset = self.scroll_offset.saturating_sub(10);
+                        }
+                    }
+                    KeyCode::PageDown => {
+                        self.scroll_offset += 10;
                     }
                     _ => {}
                 }
